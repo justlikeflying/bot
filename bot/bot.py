@@ -82,13 +82,6 @@ class Bot(commands.Bot):
         # All tasks that need to block closing until finished
         self.closing_tasks: List[asyncio.Task] = []
 
-    async def cache_filter_list_data(self) -> None:
-        """Cache all the data in the FilterList on the site."""
-        full_cache = await self.api_client.get('bot/filter-lists')
-
-        for item in full_cache:
-            self.insert_item_into_filter_list_cache(item)
-
     async def ping_services(self) -> None:
         """A helper to make sure all the services the bot relies on are available on startup."""
         # Connect Site/API
@@ -251,9 +244,6 @@ class Bot(commands.Bot):
             await self.ping_services()
         except Exception as e:
             raise StartupError(e)
-
-        # Build the FilterList cache
-        await self.cache_filter_list_data()
 
         await self.stats.create_socket()
         await super().login(*args, **kwargs)
