@@ -11,15 +11,20 @@ def unqualify(name: str) -> str:
     return name.rsplit(".", maxsplit=1)[-1]
 
 
+def ignore_module(module) -> bool:
+    """Return whether the module with name `name` should be ignored."""
+    return any(name.startswith("_") for name in module.name.split("."))
+
+
 def walk_extensions() -> Iterator[str]:
     """Yield extension names from the bot.exts subpackage."""
 
     def on_error(name: str) -> NoReturn:
         raise ImportError(name=name)  # pragma: no cover
 
-    for module in pkgutil.walk_packages(exts.__path__, f"{exts.__name__}.", onerror=on_error):
-        if unqualify(module.name).startswith("_"):
-            # Ignore module/package names starting with an underscore.
+    for module in pkgutil.walk_packages(exts.__path__, f"{exts.__name__}."):
+        if ignore_module(module):
+            # Ignore modules/packages that have a name starting with an underscore anywhere in their trees.
             continue
 
         if module.ispkg:
