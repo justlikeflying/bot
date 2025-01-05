@@ -12,7 +12,7 @@ from bot.exts.utils.snekbox._io import FILE_COUNT_LIMIT, FILE_SIZE_LIMIT, FileAt
 from bot.log import get_logger
 
 if TYPE_CHECKING:
-    from bot.exts.utils.snekbox._cog import PythonVersion
+    from bot.exts.utils.snekbox._cog import SupportedPythonVersions
 
 log = get_logger(__name__)
 
@@ -26,7 +26,7 @@ class EvalJob:
     args: list[str]
     files: list[FileAttachment] = field(default_factory=list)
     name: str = "eval"
-    version: PythonVersion = "3.11"
+    version: SupportedPythonVersions = "3.12"
 
     @classmethod
     def from_code(cls, code: str, path: str = "main.py") -> EvalJob:
@@ -36,7 +36,7 @@ class EvalJob:
             files=[FileAttachment(path, code.encode())],
         )
 
-    def as_version(self, version: PythonVersion) -> EvalJob:
+    def as_version(self, version: SupportedPythonVersions) -> EvalJob:
         """Return a copy of the job with a different Python version."""
         return EvalJob(
             args=self.args,
@@ -50,6 +50,7 @@ class EvalJob:
         return {
             "args": self.args,
             "files": [file.to_dict() for file in self.files],
+            "executable_path": f"/snekbin/python/{self.version}/bin/python",
         }
 
 
@@ -77,10 +78,10 @@ class EvalResult:
         """Return an emoji corresponding to the status code or lack of output in result."""
         if not self.has_output:
             return ":warning:"
-        elif self.returncode == 0:  # No error
+        if self.returncode == 0:  # No error
             return ":white_check_mark:"
-        else:  # Exception
-            return ":x:"
+        # Exception
+        return ":x:"
 
     @property
     def error_message(self) -> str:
@@ -141,9 +142,10 @@ class EvalResult:
         text = escape_mentions(text)
         return text
 
-    def get_message(self, job: EvalJob) -> str:
+    def get_status_message(self, job: EvalJob) -> str:
         """Return a user-friendly message corresponding to the process's return code."""
-        msg = f"Your {job.version} {job.name} job"
+        version_text = job.version.replace("t", " [free threaded](<https://docs.python.org/3.13/whatsnew/3.13.html#free-threaded-cpython>)")
+        msg = f"Your {version_text} {job.name} job"
 
         if self.returncode is None:
             msg += " has failed"

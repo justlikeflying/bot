@@ -1,26 +1,23 @@
-import asyncio
 import contextlib
 import random
 import re
-import textwrap
 import typing
 from collections import Counter
-from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Union
+from datetime import UTC, datetime, timedelta
 
 import discord
 from async_rediscache import RedisCache
-from discord import Embed, Emoji, Member, Message, NotFound, PartialMessage, TextChannel
+from discord import Embed, Emoji, Member, NotFound, PartialMessage
 from pydis_core.site_api import ResponseCodeError
+from pydis_core.utils.channel import get_or_fetch_channel
+from pydis_core.utils.members import get_or_fetch_member
 
 from bot.bot import Bot
 from bot.constants import Channels, Colours, Emojis, Guild, Roles
-from bot.exts.recruitment.talentpool._api import Nomination, NominationAPI
+from bot.exts.recruitment.talentpool._api import Nomination, NominationAPI, NominationEntry
 from bot.log import get_logger
 from bot.utils import time
-from bot.utils.channel import get_or_fetch_channel
-from bot.utils.members import get_or_fetch_member
-from bot.utils.messages import count_unique_users_reaction, pin_no_system_message
+from bot.utils.messages import count_unique_users_reaction
 
 if typing.TYPE_CHECKING:
     from bot.exts.utils.thread_bumper import ThreadBumper
@@ -34,18 +31,22 @@ MAX_EMBED_SIZE = 4000
 
 # Maximum number of active reviews
 MAX_ONGOING_REVIEWS = 3
+# Maximum number of total reviews
+MAX_TOTAL_REVIEWS = 10
 # Minimum time between reviews
 MIN_REVIEW_INTERVAL = timedelta(days=1)
 # Minimum time between nomination and sending a review
 MIN_NOMINATION_TIME = timedelta(days=7)
+# Number of days ago that the user must have activity since
+RECENT_ACTIVITY_DAYS = 7
 
 # A constant for weighting number of nomination entries against nomination age when selecting a user to review.
 # The higher this is, the lower the effect of review age. At 1, age and number of entries are weighted equally.
 REVIEW_SCORE_WEIGHT = 1.5
 
-# Regex for finding the first message of a nomination, and extracting the nominee.
+# Regex for finding a nomination, and extracting the nominee.
 NOMINATION_MESSAGE_REGEX = re.compile(
-    r"<@!?(\d+)> \(.+#\d{4}\) for Helper!\n\n",
+    r"<@!?(\d+)> \(.+(#\d{4})?\) for Helper!\n\n",
     re.MULTILINE
 )
 
@@ -90,8 +91,8 @@ class Reviewer:
 
         last_vote_timestamp = await self.status_cache.get("last_vote_date")
         if last_vote_timestamp:
-            last_vote_date = datetime.fromtimestamp(last_vote_timestamp, tz=timezone.utc)
-            time_since_last_vote = datetime.now(timezone.utc) - last_vote_date
+            last_vote_date = datetime.fromtimestamp(last_vote_timestamp, tz=UTC)
+            time_since_last_vote = datetime.now(UTC) - last_vote_date
 
             if time_since_last_vote < MIN_REVIEW_INTERVAL:
                 log.debug("Most recent review was less than %s ago, cancelling check", MIN_REVIEW_INTERVAL)
@@ -99,7 +100,9 @@ class Reviewer:
         else:
             log.info("Date of last vote not found in cache, a vote may be sent early")
 
-        review_count = 0
+        ongoing_count = 0
+        total_count = 0
+
         async for msg in voting_channel.history():
             # Try and filter out any non-review messages. We also only want to count
             # one message from reviews split over multiple messages. We use fixed text
@@ -107,68 +110,125 @@ class Reviewer:
             if not msg.author.bot or "for Helper!" not in msg.content:
                 continue
 
-            review_count += 1
+            total_count += 1
 
-            if review_count >= MAX_ONGOING_REVIEWS:
-                log.debug("There are already at least %s ongoing reviews, cancelling check.", MAX_ONGOING_REVIEWS)
+            is_ticketed = False
+            for reaction in msg.reactions:
+                if reaction.emoji == "\N{TICKET}":
+                    is_ticketed = True
+
+            if not is_ticketed:
+                ongoing_count += 1
+
+            if ongoing_count >= MAX_ONGOING_REVIEWS or total_count >= MAX_TOTAL_REVIEWS:
+                log.debug(
+                    "There are %s ongoing and %s total reviews, above thresholds of %s and %s",
+                    ongoing_count, total_count,
+                    MAX_ONGOING_REVIEWS, MAX_TOTAL_REVIEWS
+                )
                 return False
 
         return True
 
-    async def get_nomination_to_review(self) -> Optional[Nomination]:
+    @staticmethod
+    def is_nomination_old_enough(nomination: Nomination, now: datetime) -> bool:
+        """Check if a nomination is old enough to autoreview."""
+        time_since_nomination = now - nomination.inserted_at
+        return time_since_nomination > MIN_NOMINATION_TIME
+
+    @staticmethod
+    def is_user_active_enough(user_message_count: int) -> bool:
+        """Check if a user's message count is enough for them to be autoreviewed."""
+        return user_message_count > 0
+
+    async def is_nomination_ready_for_review(
+        self,
+        nomination: Nomination,
+        user_message_count: int,
+        now: datetime,
+    ) -> bool:
         """
-        Returns the Nomination of the next user to review, or None if there are no users ready.
+        Returns a boolean representing whether a nomination should be reviewed.
 
         Users will only be selected for review if:
          - They have not already been reviewed.
          - They have been nominated for longer than `MIN_NOMINATION_TIME`.
-
-        The priority of the review is determined by how many nominations the user has
-        (more nominations = higher priority).
-        For users with equal priority the oldest nomination will be reviewed first.
+         - They have sent at least one message in the server recently.
+         - They are still a member of the server.
         """
-        now = datetime.now(timezone.utc)
+        guild = self.bot.get_guild(Guild.id)
+        return (
+            # Must be an active nomination
+            nomination.active and
+            # ... that has not already been reviewed
+            not nomination.reviewed and
+            # ... and has been nominated for long enough
+            self.is_nomination_old_enough(nomination, now) and
+            # ... and is for a user that has been active recently
+            self.is_user_active_enough(user_message_count) and
+            # ... and is currently a member of the server
+            await get_or_fetch_member(guild, nomination.user_id) is not None
+        )
 
-        possible_nominations: list[Nomination] = []
+    async def sort_nominations_to_review(self, nominations: list[Nomination], now: datetime) -> list[Nomination]:
+        """
+        Sorts a list of nominations by priority for review.
+
+        The priority of the review is determined based on how many nominations the user has
+        (more nominations = higher priority), and the age of the nomination.
+        """
+        if not nominations:
+            return []
+
+        oldest_date = min(nomination.inserted_at for nomination in nominations)
+        max_entries = max(len(nomination.entries) for nomination in nominations)
+
+        def score_nomination(nomination: Nomination) -> float:
+            """
+            Scores a nomination based on age and number of nomination entries.
+
+            The higher the score, the higher the priority for being put up for review should be.
+            """
+            num_entries = len(nomination.entries)
+            entries_score = num_entries / max_entries
+
+            nomination_date = nomination.inserted_at
+            age_score = (nomination_date - now) / (oldest_date - now)
+
+            return entries_score * REVIEW_SCORE_WEIGHT + age_score
+
+        return sorted(nominations, key=score_nomination, reverse=True)
+
+    async def get_nomination_to_review(self) -> Nomination | None:
+        """
+        Returns the Nomination of the next user to review, or None if there are no users ready.
+
+        See `is_ready_for_review` for the criteria for a user to be ready for review.
+        See `sort_nominations_to_review` for the criteria for a user to be prioritised for review.
+        """
+        now = datetime.now(UTC)
         nominations = await self.api.get_nominations(active=True)
-        for nomination in nominations:
-            time_since_nomination = now - nomination.inserted_at
-            if (
-                not nomination.reviewed
-                and time_since_nomination > MIN_NOMINATION_TIME
-            ):
-                possible_nominations.append(nomination)
-
-        if not possible_nominations:
-            log.debug("No users ready to review.")
+        if not nominations:
             return None
 
-        oldest_date = min(nomination.inserted_at for nomination in possible_nominations)
-        max_entries = max(len(nomination.entries) for nomination in possible_nominations)
+        messages_per_user = await self.api.get_activity(
+            [nomination.user_id for nomination in nominations],
+            days=RECENT_ACTIVITY_DAYS,
+        )
+        possible_nominations = [
+            nomination for nomination in nominations
+            if await self.is_nomination_ready_for_review(nomination, messages_per_user[nomination.user_id], now)
+        ]
+        if not possible_nominations:
+            log.info("No nominations are ready to review")
+            return None
 
-        def sort_key(nomination: Nomination) -> float:
-            return self.score_nomination(nomination, oldest_date, now, max_entries)
-
-        return max(possible_nominations, key=sort_key)
-
-    @staticmethod
-    def score_nomination(nomination: Nomination, oldest_date: datetime, now: datetime, max_entries: int) -> float:
-        """
-        Scores a nomination based on age and number of nomination entries.
-
-        The higher the score, the higher the priority for being put up for review should be.
-        """
-        num_entries = len(nomination.entries)
-        entries_score = num_entries / max_entries
-
-        nomination_date = nomination.inserted_at
-        age_score = (nomination_date - now) / (oldest_date - now)
-
-        return entries_score * REVIEW_SCORE_WEIGHT + age_score
+        sorted_nominations = await self.sort_nominations_to_review(possible_nominations, now)
+        return sorted_nominations[0]
 
     async def post_review(self, nomination: Nomination) -> None:
         """Format the review of a user and post it to the nomination voting channel."""
-        review, reviewed_emoji, nominee = await self.make_review(nomination)
+        review, reviewed_emoji, nominee, nominations = await self.make_review(nomination)
         if not nominee:
             return
 
@@ -176,21 +236,27 @@ class Reviewer:
         channel = guild.get_channel(Channels.nomination_voting)
 
         log.info(f"Posting the review of {nominee} ({nominee.id})")
-        messages = await self._bulk_send(channel, review)
+        vote_message = await channel.send(review)
 
-        await pin_no_system_message(messages[0])
-
-        last_message = messages[-1]
         if reviewed_emoji:
             for reaction in (reviewed_emoji, "\N{THUMBS UP SIGN}", "\N{THUMBS DOWN SIGN}"):
-                await last_message.add_reaction(reaction)
+                await vote_message.add_reaction(reaction)
 
-        thread = await last_message.create_thread(
+        thread = await vote_message.create_thread(
             name=f"Nomination - {nominee}",
         )
+
+        nomination_messages = []
+        for batch in nominations:
+            nomination_messages.append(await thread.send(batch))
+
+        # Pin the later messages first so the "Nominated by:" message is at the top of the pins list
+        for nom_message in nomination_messages[::-1]:
+            await nom_message.pin()
+
         message = await thread.send(f"<@&{Roles.mod_team}> <@&{Roles.admins}>")
 
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         await self.status_cache.set("last_vote_date", now.timestamp())
 
         await self.api.edit_nomination(nomination.id, reviewed=True, thread_id=thread.id)
@@ -200,7 +266,7 @@ class Reviewer:
             context = await self.bot.get_context(message)
             await bump_cog.add_thread_to_bump_list(context, thread)
 
-    async def make_review(self, nomination: Nomination) -> typing.Tuple[str, Optional[Emoji], Optional[Member]]:
+    async def make_review(self, nomination: Nomination) -> tuple[str, Emoji | None, Member | None]:
         """Format a generic review of a user and return it with the reviewed emoji and the user themselves."""
         log.trace(f"Formatting the review of {nomination.user_id}")
 
@@ -215,13 +281,9 @@ class Reviewer:
 
         opening = f"{nominee.mention} ({nominee}) for Helper!"
 
-        current_nominations = "\n\n".join(
-            f"**<@{entry.actor_id}>:** {entry.reason or '*no reason given*'}"
-            for entry in nomination.entries[::-1]
-        )
-        current_nominations = f"**Nominated by:**\n{current_nominations}"
+        nominations = self._make_nomination_batches(nomination.entries)
 
-        review_body = await self._construct_review_body(nominee)
+        review_body = await self._construct_review_body(nominee, nomination)
 
         reviewed_emoji = self._random_ducky(guild)
         vote_request = (
@@ -230,60 +292,77 @@ class Reviewer:
             " and react :+1: for approval, or :-1: for disapproval*."
         )
 
-        review = "\n\n".join((opening, current_nominations, review_body, vote_request))
-        return review, reviewed_emoji, nominee
+        review = "\n\n".join((opening, review_body, vote_request))
+        return review, reviewed_emoji, nominee, nominations
+
+    def _make_nomination_batches(self, entries: list[NominationEntry]) -> list[str]:
+        """Construct the batches of nominations to send into the voting thread."""
+        messages = ["**Nominated by:**"]
+
+        formatted = [f"**<@{entry.actor_id}>:** {entry.reason or '*no reason given*'}" for entry in entries[::-1]]
+
+        for entry in formatted:
+            # Add the nomination to the current last message in the message batches
+            potential_message = messages[-1] + f"\n\n{entry}"
+
+            # Test if adding this entry pushes us over the character limit
+            if len(potential_message) >= MAX_MESSAGE_SIZE:
+                # If it does, create a new message starting with this entry
+                messages.append(entry)
+            else:
+                # If it doesn't, we will use this message
+                messages[-1] = potential_message
+
+        return messages
 
     async def archive_vote(self, message: PartialMessage, passed: bool) -> None:
         """Archive this vote to #nomination-archive."""
         message = await message.fetch()
 
-        # We consider the first message in the nomination to contain the user ping, username#discrim, and fixed text
-        messages = [message]
-        if not NOMINATION_MESSAGE_REGEX.search(message.content):
-            async for new_message in message.channel.history(before=message.created_at):
-                messages.append(new_message)
-
-                if NOMINATION_MESSAGE_REGEX.search(new_message.content):
-                    break
-
-        log.debug(f"Found {len(messages)} messages: {', '.join(str(m.id) for m in messages)}")
-
-        parts = []
-        for message_ in messages[::-1]:
-            parts.append(message_.content)
-            parts.append("\n" if message_.content.endswith(".") else " ")
-        content = "".join(parts)
+        # Thread channel IDs are the same as the message ID of the parent message.
+        nomination_thread = message.guild.get_thread(message.id)
+        if not nomination_thread:
+            try:
+                nomination_thread = await message.guild.fetch_channel(message.id)
+            except NotFound:
+                log.warning(f"Could not find a thread linked to {message.channel.id}-{message.id}")
 
         # We assume that the first user mentioned is the user that we are voting on
-        user_id = int(NOMINATION_MESSAGE_REGEX.search(content).group(1))
+        user_id = int(NOMINATION_MESSAGE_REGEX.search(message.content).group(1))
 
         # Get reaction counts
         reviewed = await count_unique_users_reaction(
-            messages[0],
+            message,
             lambda r: "ducky" in str(r) or str(r) == "\N{EYES}",
             count_bots=False
         )
         upvotes = await count_unique_users_reaction(
-            messages[0],
+            message,
             lambda r: str(r) == "\N{THUMBS UP SIGN}",
             count_bots=False
         )
         downvotes = await count_unique_users_reaction(
-            messages[0],
+            message,
             lambda r: str(r) == "\N{THUMBS DOWN SIGN}",
             count_bots=False
         )
 
         # Remove the first and last paragraphs
-        stripped_content = content.split("\n\n", maxsplit=1)[1].rsplit("\n\n", maxsplit=1)[0]
+        stripped_content = message.content.split("\n\n", maxsplit=1)[1].rsplit("\n\n", maxsplit=1)[0]
 
         result = f"**Passed** {Emojis.incident_actioned}" if passed else f"**Rejected** {Emojis.incident_unactioned}"
         colour = Colours.soft_green if passed else Colours.soft_red
-        timestamp = datetime.utcnow().strftime("%Y/%m/%d")
+        timestamp = datetime.now(tz=UTC).strftime("%Y/%m/%d")
+
+        if nomination_thread:
+            thread_jump = f"[Jump to vote thread]({nomination_thread.jump_url})"
+        else:
+            thread_jump = "Failed to get thread"
 
         embed_content = (
             f"{result} on {timestamp}\n"
-            f"With {reviewed} {Emojis.ducky_dave} {upvotes} :+1: {downvotes} :-1:\n\n"
+            f"With {reviewed} {Emojis.ducky_dave} {upvotes} :+1: {downvotes} :-1:\n"
+            f"{thread_jump}\n\n"
             f"{stripped_content}"
         )
 
@@ -293,41 +372,35 @@ class Reviewer:
             embed_title = f"Vote for `{user_id}`"
 
         channel = self.bot.get_channel(Channels.nomination_voting_archive)
-        for number, part in enumerate(
-                textwrap.wrap(embed_content, width=MAX_EMBED_SIZE, replace_whitespace=False, placeholder="")
-        ):
-            await channel.send(embed=Embed(
-                title=embed_title if number == 0 else None,
-                description="[...] " + part if number != 0 else part,
-                colour=colour
-            ))
+        await channel.send(embed=Embed(
+            title=embed_title,
+            description=embed_content,
+            colour=colour
+        ))
 
-        # Thread channel IDs are the same as the message ID of the parent message.
-        nomination_thread = message.guild.get_thread(message.id)
-        if not nomination_thread:
-            try:
-                nomination_thread = await message.guild.fetch_channel(message.id)
-            except NotFound:
-                log.warning(f"Could not find a thread linked to {message.channel.id}-{message.id}")
-                return
+        await message.delete()
 
-        for message_ in messages:
+        if nomination_thread:
             with contextlib.suppress(NotFound):
-                await message_.delete()
+                await nomination_thread.edit(archived=True)
 
-        with contextlib.suppress(NotFound):
-            await nomination_thread.edit(archived=True)
-
-    async def _construct_review_body(self, member: Member) -> str:
+    async def _construct_review_body(self, member: Member, nomination: Nomination) -> str:
         """Formats the body of the nomination, with details of activity, infractions, and previous nominations."""
         activity = await self._activity_review(member)
+        nominations = await self._nominations_review(nomination)
         infractions = await self._infractions_review(member)
         prev_nominations = await self._previous_nominations_review(member)
 
-        body = f"{activity}\n\n{infractions}"
+        body = f"{nominations}\n\n{activity}\n\n{infractions}"
         if prev_nominations:
             body += f"\n\n{prev_nominations}"
         return body
+
+    async def _nominations_review(self, nomination: Nomination) -> str:
+        """Format a brief summary of how many nominations in this voting round the nominee has."""
+        entry_count = len(nomination.entries)
+
+        return f"They have **{entry_count}** nomination{'s' if entry_count != 1 else ''} this round."
 
     async def _activity_review(self, member: Member) -> str:
         """
@@ -377,8 +450,8 @@ class Reviewer:
         """
         log.trace(f"Fetching the infraction data for {member.id}'s review")
         infraction_list = await self.bot.api_client.get(
-            'bot/infractions/expanded',
-            params={'user__id': str(member.id), 'ordering': '-inserted_at'}
+            "bot/infractions/expanded",
+            params={"user__id": str(member.id), "ordering": "-inserted_at"}
         )
 
         log.trace(f"{len(infraction_list)} infractions found for {member.id}, formatting review.")
@@ -409,7 +482,7 @@ class Reviewer:
             infractions += ", with the last infraction issued "
 
         # Infractions were ordered by time since insertion descending.
-        infractions += time.format_relative(infraction_list[0]['inserted_at'])
+        infractions += time.format_relative(infraction_list[0]["inserted_at"])
 
         return f"They have {infractions}."
 
@@ -423,13 +496,13 @@ class Reviewer:
         """
         formatted = infr_type.replace("_", " ")
         if count > 1:
-            if infr_type.endswith(('ch', 'sh')):
+            if infr_type.endswith(("ch", "sh")):
                 formatted += "e"
             formatted += "s"
 
         return formatted
 
-    async def _previous_nominations_review(self, member: Member) -> Optional[str]:
+    async def _previous_nominations_review(self, member: Member) -> str | None:
         """
         Formats the review of the nominee's previous nominations.
 
@@ -440,7 +513,7 @@ class Reviewer:
 
         log.trace(f"{len(history)} previous nominations found for {member.id}, formatting review.")
         if not history:
-            return
+            return None
 
         num_entries = sum(len(nomination.entries) for nomination in history)
 
@@ -452,7 +525,7 @@ class Reviewer:
             if nomination.thread_id is None:
                 continue
             try:
-                thread = await get_or_fetch_channel(nomination.thread_id)
+                thread = await get_or_fetch_channel(self.bot, nomination.thread_id)
             except discord.HTTPException:
                 # Nothing to do here
                 pass
@@ -476,26 +549,9 @@ class Reviewer:
         return review
 
     @staticmethod
-    def _random_ducky(guild: Guild) -> Union[Emoji, str]:
+    def _random_ducky(guild: Guild) -> Emoji | str:
         """Picks a random ducky emoji. If no duckies found returns 👀."""
         duckies = [emoji for emoji in guild.emojis if emoji.name.startswith("ducky")]
         if not duckies:
             return "\N{EYES}"
         return random.choice(duckies)
-
-    @staticmethod
-    async def _bulk_send(channel: TextChannel, text: str) -> List[Message]:
-        """
-        Split a text into several if necessary, and post them to the channel.
-
-        Returns the resulting message objects.
-        """
-        messages = textwrap.wrap(text, width=MAX_MESSAGE_SIZE, replace_whitespace=False)
-        log.trace(f"The provided string will be sent to the channel {channel.id} as {len(messages)} messages.")
-
-        results = []
-        for message in messages:
-            await asyncio.sleep(1)
-            results.append(await channel.send(message))
-
-        return results

@@ -1,10 +1,13 @@
 import copy
 import difflib
 
-from discord import Embed, Member
+import discord
+from discord import ButtonStyle, Embed, Forbidden, Interaction, Member, User
 from discord.ext.commands import ChannelNotFound, Cog, Context, TextChannelConverter, VoiceChannelConverter, errors
 from pydis_core.site_api import ResponseCodeError
-from sentry_sdk import push_scope
+from pydis_core.utils.error_handling import handle_forbidden_from_block
+from pydis_core.utils.interactions import DeleteMessageButton, ViewWithUserAndRoleCheck
+from sentry_sdk import new_scope
 
 from bot.bot import Bot
 from bot.constants import Colours, Icons, MODERATION_ROLES
@@ -13,6 +16,35 @@ from bot.log import get_logger
 from bot.utils.checks import ContextCheckFailure
 
 log = get_logger(__name__)
+
+
+class HelpEmbedView(ViewWithUserAndRoleCheck):
+    """View to allow showing the help command for command error responses."""
+
+    def __init__(self, help_embed: Embed, owner: User | Member):
+        super().__init__(allowed_roles=MODERATION_ROLES, allowed_users=[owner.id])
+        self.help_embed = help_embed
+
+        self.delete_button = DeleteMessageButton()
+        self.add_item(self.delete_button)
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        """Overriden check to allow anyone to use the help button."""
+        if (interaction.data or {}).get("custom_id") == self.help_button.custom_id:
+            log.trace(
+                "Allowed interaction by %s (%d) on %d as interaction was with the help button.",
+                interaction.user,
+                interaction.user.id,
+                interaction.message.id,
+            )
+            return True
+
+        return await super().interaction_check(interaction)
+
+    @discord.ui.button(label="Help", style=ButtonStyle.primary)
+    async def help_button(self, interaction: Interaction, button: discord.ui.Button) -> None:
+        """Send an ephemeral message with the contents of the help command."""
+        await interaction.response.send_message(embed=self.help_embed, ephemeral=True)
 
 
 class ErrorHandler(Cog):
@@ -64,18 +96,31 @@ class ErrorHandler(Cog):
         )
 
         if isinstance(e, errors.CommandNotFound) and not getattr(ctx, "invoked_from_error_handler", False):
-            if await self.try_silence(ctx):
-                return
-            if await self.try_run_fixed_codeblock(ctx):
-                return
-            await self.try_get_tag(ctx)  # Try to look for a tag with the command's name
+            # We might not invoke a command from the error handler, but it's easier and safer to ensure
+            # this is always set rather than trying to get it exact, and shouldn't cause any issues.
+            ctx.invoked_from_error_handler = True
+
+            # All errors from attempting to execute these commands should be handled by the error handler.
+            # We wrap non CommandErrors in CommandInvokeError to mirror the behaviour of normal commands.
+            try:
+                if await self.try_silence(ctx):
+                    return
+                if await self.try_run_fixed_codeblock(ctx):
+                    return
+                await self.try_get_tag(ctx)
+            except Exception as err:
+                log.info("Re-handling error raised by command in error handler")
+                if isinstance(err, errors.CommandError):
+                    await self.on_command_error(ctx, err)
+                else:
+                    await self.on_command_error(ctx, errors.CommandInvokeError(err))
         elif isinstance(e, errors.UserInputError):
             log.debug(debug_message)
             await self.handle_user_input_error(ctx, e)
         elif isinstance(e, errors.CheckFailure):
             log.debug(debug_message)
             await self.handle_check_failure(ctx, e)
-        elif isinstance(e, (errors.CommandOnCooldown, errors.MaxConcurrencyReached)):
+        elif isinstance(e, errors.CommandOnCooldown | errors.MaxConcurrencyReached):
             log.debug(debug_message)
             await ctx.send(e)
         elif isinstance(e, errors.CommandInvokeError):
@@ -85,6 +130,11 @@ class ErrorHandler(Cog):
                 await ctx.send(f"{e.original} Please wait for it to finish and try again later.")
             elif isinstance(e.original, InvalidInfractedUserError):
                 await ctx.send(f"Cannot infract that user. {e.original.reason}")
+            elif isinstance(e.original, Forbidden):
+                try:
+                    await handle_forbidden_from_block(e.original, ctx.message)
+                except Forbidden:
+                    await self.handle_unexpected_error(ctx, e.original)
             else:
                 await self.handle_unexpected_error(ctx, e.original)
         elif isinstance(e, errors.ConversionError):
@@ -97,15 +147,6 @@ class ErrorHandler(Cog):
         else:
             # ExtensionError
             await self.handle_unexpected_error(ctx, e)
-
-    async def send_command_help(self, ctx: Context) -> None:
-        """Return a prepared `help` command invocation coroutine."""
-        if ctx.command:
-            self.bot.help_command.context = ctx
-            await ctx.send_help(ctx.command)
-            return
-
-        await ctx.send_help()
 
     async def try_silence(self, ctx: Context) -> bool:
         """
@@ -123,7 +164,6 @@ class ErrorHandler(Cog):
 
         command = ctx.invoked_with.lower()
         args = ctx.message.content.lower().split(" ")
-        ctx.invoked_from_error_handler = True
 
         try:
             if not await silence_command.can_run(ctx):
@@ -154,19 +194,13 @@ class ErrorHandler(Cog):
         if command.startswith("shh"):
             await ctx.invoke(silence_command, duration_or_channel=channel, duration=duration, kick=kick)
             return True
-        elif command.startswith("unshh"):
+        if command.startswith("unshh"):
             await ctx.invoke(self.bot.get_command("unsilence"), channel=channel)
             return True
         return False
 
     async def try_get_tag(self, ctx: Context) -> None:
-        """
-        Attempt to display a tag by interpreting the command name as a tag name.
-
-        The invocation of tags get respects its checks. Any CommandErrors raised will be handled
-        by `on_command_error`, but the `invoked_from_error_handler` attribute will be added to
-        the context to prevent infinite recursion in the case of a CommandNotFound exception.
-        """
+        """Attempt to display a tag by interpreting the command name as a tag name."""
         tags_cog = self.bot.get_cog("Tags")
         if not tags_cog:
             log.debug("Not attempting to parse message as a tag as could not find `Tags` cog.")
@@ -177,23 +211,19 @@ class ErrorHandler(Cog):
         if not maybe_tag_name or not isinstance(ctx.author, Member):
             return
 
-        ctx.invoked_from_error_handler = True
         try:
             if not await self.bot.can_run(ctx):
                 log.debug("Cancelling attempt to fall back to a tag due to failed checks.")
                 return
+        except errors.CommandError:
+            log.debug("Cancelling attempt to fall back to a tag due to failed checks.")
+            return
 
-            if await tags_get_command(ctx, maybe_tag_name):
-                return
+        if await tags_get_command(ctx, maybe_tag_name):
+            return
 
-            if not any(role.id in MODERATION_ROLES for role in ctx.author.roles):
-                await self.send_command_suggestion(ctx, maybe_tag_name)
-        except Exception as err:
-            log.debug("Error while attempting to invoke tag fallback.")
-            if isinstance(err, errors.CommandError):
-                await self.on_command_error(ctx, err)
-            else:
-                await self.on_command_error(ctx, errors.CommandInvokeError(err))
+        if not any(role.id in MODERATION_ROLES for role in ctx.author.roles):
+            await self.send_command_suggestion(ctx, maybe_tag_name)
 
     async def try_run_fixed_codeblock(self, ctx: Context) -> bool:
         """
@@ -292,8 +322,21 @@ class ErrorHandler(Cog):
             )
             self.bot.stats.incr("errors.other_user_input_error")
 
-        await ctx.send(embed=embed)
-        await self.send_command_help(ctx)
+        await self.send_error_with_help(ctx, embed)
+
+    async def send_error_with_help(self, ctx: Context, error_embed: Embed) -> None:
+        """Send error message, with button to show command help."""
+        # Fall back to just sending the error embed if the custom help cog isn't loaded yet.
+        # ctx.command shouldn't be None here, but check just to be safe.
+        help_embed_creator = getattr(self.bot.help_command, "command_formatting", None)
+        if not help_embed_creator or not ctx.command:
+            await ctx.send(embed=error_embed)
+            return
+
+        self.bot.help_command.context = ctx
+        help_embed, _ = await help_embed_creator(ctx.command)
+        view = HelpEmbedView(help_embed, ctx.author)
+        view.message = await ctx.send(embed=error_embed, view=view)
 
     @staticmethod
     async def handle_check_failure(ctx: Context, e: errors.CheckFailure) -> None:
@@ -319,7 +362,7 @@ class ErrorHandler(Cog):
             await ctx.send(
                 "Sorry, it looks like I don't have the permissions or roles I need to do that."
             )
-        elif isinstance(e, (ContextCheckFailure, errors.NoPrivateMessage)):
+        elif isinstance(e, ContextCheckFailure | errors.NoPrivateMessage):
             ctx.bot.stats.incr("errors.wrong_channel_or_dm_error")
             await ctx.send(e)
 
@@ -357,7 +400,7 @@ class ErrorHandler(Cog):
 
         ctx.bot.stats.incr("errors.unexpected")
 
-        with push_scope() as scope:
+        with new_scope() as scope:
             scope.user = {
                 "id": ctx.author.id,
                 "username": str(ctx.author)

@@ -1,36 +1,35 @@
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import re
+from collections.abc import Iterable
 from functools import partial
 from operator import attrgetter
 from textwrap import dedent
-from typing import Literal, NamedTuple, Optional, TYPE_CHECKING
+from typing import Literal, NamedTuple, TYPE_CHECKING, get_args
 
 from discord import AllowedMentions, HTTPException, Interaction, Message, NotFound, Reaction, User, enums, ui
 from discord.ext.commands import Cog, Command, Context, Converter, command, guild_only
-from pydis_core.utils import interactions
+from pydis_core.utils import interactions, paste_service
+from pydis_core.utils.paste_service import PasteFile, send_to_paste_service
 from pydis_core.utils.regex import FORMATTED_CODE_REGEX, RAW_CODE_REGEX
 
 from bot.bot import Bot
-from bot.constants import Channels, Emojis, Filter, MODERATION_ROLES, Roles, URLs
+from bot.constants import BaseURLs, Channels, Emojis, MODERATION_ROLES, Roles, URLs
 from bot.decorators import redirect_output
-from bot.exts.events.code_jams._channels import CATEGORY_NAME as JAM_CATEGORY_NAME
-from bot.exts.filters.antimalware import TXT_LIKE_FILES
+from bot.exts.filtering._filter_lists.extension import TXT_LIKE_FILES
 from bot.exts.help_channels._channel import is_help_forum_post
 from bot.exts.utils.snekbox._eval import EvalJob, EvalResult
 from bot.exts.utils.snekbox._io import FileAttachment
 from bot.log import get_logger
-from bot.utils import send_to_paste_service
 from bot.utils.lock import LockedResourceError, lock_arg
-from bot.utils.services import PasteTooLongError, PasteUploadError
 
 if TYPE_CHECKING:
-    from bot.exts.filters.filtering import Filtering
+    from bot.exts.filtering.filtering import Filtering
 
 log = get_logger(__name__)
 
+ANSI_REGEX = re.compile(r"\N{ESC}\[[0-9;:]*m")
 ESCAPE_REGEX = re.compile("[`\u202E\u200B]{3,}")
 
 # The timeit command should only output the very last line, so all other output should be suppressed.
@@ -75,7 +74,6 @@ if not hasattr(sys, "_setup_finished"):
 {setup}
 """
 
-MAX_PASTE_LENGTH = 10_000
 # Max to display in a codeblock before sending to a paste service
 # This also applies to text files
 MAX_OUTPUT_BLOCK_LINES = 10
@@ -86,12 +84,14 @@ NO_SNEKBOX_CHANNELS = (Channels.python_general,)
 NO_SNEKBOX_CATEGORIES = ()
 SNEKBOX_ROLES = (Roles.helpers, Roles.moderators, Roles.admins, Roles.owners, Roles.python_community, Roles.partners)
 
-REDO_EMOJI = '\U0001f501'  # :repeat:
+REDO_EMOJI = "\U0001f501"  # :repeat:
 REDO_TIMEOUT = 30
 
-PythonVersion = Literal["3.10", "3.11"]
+SupportedPythonVersions = Literal["3.12", "3.13", "3.13t"]
 
-FilteredFiles = NamedTuple("FilteredFiles", [("allowed", list[FileAttachment]), ("blocked", list[FileAttachment])])
+class FilteredFiles(NamedTuple):
+    allowed: list[FileAttachment]
+    blocked: list[FileAttachment]
 
 
 class CodeblockConverter(Converter):
@@ -136,13 +136,13 @@ class PythonVersionSwitcherButton(ui.Button):
 
     def __init__(
         self,
-        version_to_switch_to: PythonVersion,
+        version_to_run: SupportedPythonVersions,
         snekbox_cog: Snekbox,
         ctx: Context,
         job: EvalJob,
     ) -> None:
-        self.version_to_switch_to = version_to_switch_to
-        super().__init__(label=f"Run in {self.version_to_switch_to}", style=enums.ButtonStyle.primary)
+        self.version_to_run = version_to_run
+        super().__init__(label=f"Run in {self.version_to_run}", style=enums.ButtonStyle.primary)
 
         self.snekbox_cog = snekbox_cog
         self.ctx = ctx
@@ -163,7 +163,7 @@ class PythonVersionSwitcherButton(ui.Button):
             # The log arg on send_job will stop the actual job from running.
             await interaction.message.delete()
 
-        await self.snekbox_cog.run_job(self.ctx, self.job.as_version(self.version_to_switch_to))
+        await self.snekbox_cog.run_job(self.ctx, self.job.as_version(self.version_to_run))
 
 
 class Snekbox(Cog):
@@ -175,48 +175,46 @@ class Snekbox(Cog):
 
     def build_python_version_switcher_view(
         self,
-        current_python_version: PythonVersion,
+        current_python_version: SupportedPythonVersions,
         ctx: Context,
         job: EvalJob,
     ) -> interactions.ViewWithUserAndRoleCheck:
         """Return a view that allows the user to change what version of Python their code is run on."""
-        alt_python_version: PythonVersion
-        if current_python_version == "3.10":
-            alt_python_version = "3.11"
-        else:
-            alt_python_version = "3.10"
+        other_versions = list(get_args(SupportedPythonVersions))
+        other_versions.remove(current_python_version)
 
         view = interactions.ViewWithUserAndRoleCheck(
             allowed_users=(ctx.author.id,),
             allowed_roles=MODERATION_ROLES,
         )
-        view.add_item(PythonVersionSwitcherButton(alt_python_version, self, ctx, job))
+        for version in other_versions:
+            view.add_item(PythonVersionSwitcherButton(version, self, ctx, job))
         view.add_item(interactions.DeleteMessageButton())
 
         return view
 
     async def post_job(self, job: EvalJob) -> EvalResult:
         """Send a POST request to the Snekbox API to evaluate code and return the results."""
-        if job.version == "3.10":
-            url = URLs.snekbox_eval_api
-        else:
-            url = URLs.snekbox_311_eval_api
-
         data = job.to_dict()
 
-        async with self.bot.http_session.post(url, json=data, raise_for_status=True) as resp:
+        async with self.bot.http_session.post(URLs.snekbox_eval_api, json=data, raise_for_status=True) as resp:
             return EvalResult.from_dict(await resp.json())
 
-    @staticmethod
-    async def upload_output(output: str) -> Optional[str]:
+    async def upload_output(self, output: str) -> str | None:
         """Upload the job's output to a paste service and return a URL to it if successful."""
         log.trace("Uploading full output to paste service...")
 
+        file = PasteFile(content=output, lexer="text")
         try:
-            return await send_to_paste_service(output, extension="txt", max_length=MAX_PASTE_LENGTH)
-        except PasteTooLongError:
+            paste_response = await send_to_paste_service(
+                files=[file],
+                http_session=self.bot.http_session,
+                paste_url=BaseURLs.paste_url,
+            )
+            return paste_response.link
+        except paste_service.PasteTooLongError:
             return "too long to upload"
-        except PasteUploadError:
+        except paste_service.PasteUploadError:
             return "unable to upload"
 
     @staticmethod
@@ -264,14 +262,17 @@ class Snekbox(Cog):
         truncated = False
         lines = output.splitlines()
 
-        if len(lines) > 1:
-            if line_nums:
-                lines = [f"{i:03d} | {line}" for i, line in enumerate(lines, 1)]
-            lines = lines[:max_lines+1]  # Limiting to max+1 lines
+        if len(lines) > 1 and line_nums:
+            lines = [f"{i:03d} | {line}" for i, line in enumerate(lines, 1)]
             output = "\n".join(lines)
 
         if len(lines) > max_lines:
             truncated = True
+            if len(lines) == max_lines + 1:
+                lines = lines[:max_lines - 1]
+            else:
+                lines = lines[:max_lines]
+            output = "\n".join(lines)
             if len(output) >= max_chars:
                 output = f"{output[:max_chars]}\n... (truncated - too long, too many lines)"
             else:
@@ -281,44 +282,95 @@ class Snekbox(Cog):
             output = f"{output[:max_chars]}\n... (truncated - too long)"
 
         if truncated:
-            paste_link = await self.upload_output(original_output)
+            # ANSI colors are quite nice, but don't render in pinwand,
+            #   thus mangling the output
+            ansiless_output = ANSI_REGEX.sub("", original_output)
+            paste_link = await self.upload_output(ansiless_output)
 
         if output_default and not output:
             output = output_default
 
         return output, paste_link
 
-    def get_extensions_whitelist(self) -> set[str]:
-        """Return a set of whitelisted file extensions."""
-        return set(self.bot.filter_list_cache['FILE_FORMAT.True'].keys()) | TXT_LIKE_FILES
+    async def format_file_text(self, text_files: list[FileAttachment], output: str) -> str:
+        # Inline until budget, then upload to paste service
+        # Budget is shared with stdout, so subtract what we've already used
+        budget_lines = MAX_OUTPUT_BLOCK_LINES - (output.count("\n") + 1)
+        budget_chars = MAX_OUTPUT_BLOCK_CHARS - len(output)
+        msg = ""
 
-    def _filter_files(self, ctx: Context, files: list[FileAttachment]) -> FilteredFiles:
+        for file in text_files:
+            file_text = file.content.decode("utf-8", errors="replace") or "[Empty]"
+            # Override to always allow 1 line and <= 50 chars, since this is less than a link
+            if len(file_text) <= 50 and not file_text.count("\n"):
+                msg += f"\n`{file.name}`\n```\n{file_text}\n```"
+            # otherwise, use budget
+            else:
+                format_text, link_text = await self.format_output(
+                    file_text,
+                    budget_lines,
+                    budget_chars,
+                    line_nums=False,
+                    output_default="[Empty]"
+                )
+                # With any link, use it (don't use budget)
+                if link_text:
+                    msg += f"\n`{file.name}`\n{link_text}"
+                else:
+                    msg += f"\n`{file.name}`\n```\n{format_text}\n```"
+                    budget_lines -= format_text.count("\n") + 1
+                    budget_chars -= len(file_text)
+
+        return msg
+
+    def format_blocked_extensions(self, blocked: list[FileAttachment]) -> str:
+        # Sort by length and then lexicographically to fit as many as possible before truncating.
+        blocked_sorted = sorted(set(f.suffix for f in blocked),  key=lambda e: (len(e), e))
+
+        # Only no extension
+        if len(blocked_sorted) == 1 and blocked_sorted[0] == "":
+            blocked_msg = "Files with no extension can't be uploaded."
+        # Both
+        elif "" in blocked_sorted:
+            blocked_str = self.join_blocked_extensions(ext for ext in blocked_sorted if ext)
+            blocked_msg = (
+                f"Files with no extension or disallowed extensions can't be uploaded: **{blocked_str}**"
+            )
+        else:
+            blocked_str = self.join_blocked_extensions(blocked_sorted)
+            blocked_msg = f"Files with disallowed extensions can't be uploaded: **{blocked_str}**"
+
+        return f"\n{Emojis.failed_file} {blocked_msg}"
+
+    def join_blocked_extensions(self, extensions: Iterable[str], delimiter: str = ", ", char_limit: int = 100) -> str:
+        joined = ""
+        for ext in extensions:
+            cur_delimiter = delimiter if joined else ""
+            if len(joined) + len(cur_delimiter) + len(ext) >= char_limit:
+                joined += f"{cur_delimiter}..."
+                break
+
+            joined += f"{cur_delimiter}{ext}"
+
+        return joined
+
+
+    def _filter_files(self, ctx: Context, files: list[FileAttachment], blocked_exts: set[str]) -> FilteredFiles:
         """Filter to restrict files to allowed extensions. Return a named tuple of allowed and blocked files lists."""
-        # Check if user is staff, if is, return
-        # Since we only care that roles exist to iterate over, check for the attr rather than a User/Member instance
-        if hasattr(ctx.author, "roles") and any(role.id in Filter.role_whitelist for role in ctx.author.roles):
-            return FilteredFiles(files, [])
-        # Ignore code jam channels
-        if getattr(ctx.channel, "category", None) and ctx.channel.category.name == JAM_CATEGORY_NAME:
-            return FilteredFiles(files, [])
-
-        # Get whitelisted extensions
-        whitelist = self.get_extensions_whitelist()
-
         # Filter files into allowed and blocked
         blocked = []
         allowed = []
         for file in files:
-            if file.suffix in whitelist:
-                allowed.append(file)
-            else:
+            if file.suffix in blocked_exts:
                 blocked.append(file)
+            else:
+                allowed.append(file)
 
         if blocked:
             blocked_str = ", ".join(f.suffix for f in blocked)
             log.info(
                 f"User '{ctx.author}' ({ctx.author.id}) uploaded blacklisted file(s) in eval: {blocked_str}",
-                extra={"attachment_list": [f.path for f in files]}
+                extra={"attachment_list": [f.filename for f in files]}
             )
 
         return FilteredFiles(allowed, blocked)
@@ -332,25 +384,27 @@ class Snekbox(Cog):
         """
         async with ctx.typing():
             result = await self.post_job(job)
-            msg = result.get_message(job)
-            error = result.error_message
-
-            if error:
-                output, paste_link = error, None
+            # Collect stats of job fails + successes
+            if result.returncode != 0:
+                self.bot.stats.incr("snekbox.python.fail")
             else:
-                log.trace("Formatting output...")
-                output, paste_link = await self.format_output(result.stdout)
+                self.bot.stats.incr("snekbox.python.success")
 
-            msg = f"{ctx.author.mention} {result.status_emoji} {msg}.\n"
+            log.trace("Formatting output...")
+            output = result.error_message if result.error_message else result.stdout
+            output, paste_link = await self.format_output(output)
+
+            status_msg = result.get_status_message(job)
+            msg = f"{result.status_emoji} {status_msg}.\n"
 
             # This is done to make sure the last line of output contains the error
             # and the error is not manually printed by the author with a syntax error.
             if result.stdout.rstrip().endswith("EOFError: EOF when reading a line") and result.returncode == 1:
-                msg += ":warning: Note: `input` is not supported by the bot :warning:\n\n"
+                msg += "\n:warning: Note: `input` is not supported by the bot :warning:\n"
 
             # Skip output if it's empty and there are file uploads
             if result.stdout or not result.has_files:
-                msg += f"\n```\n{output}\n```"
+                msg += f"\n```ansi\n{output}\n```"
 
             if paste_link:
                 msg += f"\nFull output: {paste_link}"
@@ -359,72 +413,45 @@ class Snekbox(Cog):
             if files_error := result.files_error_message:
                 msg += f"\n{files_error}"
 
-            # Collect stats of job fails + successes
-            if result.returncode != 0:
-                self.bot.stats.incr("snekbox.python.fail")
-            else:
-                self.bot.stats.incr("snekbox.python.success")
-
-            # Filter file extensions
-            allowed, blocked = self._filter_files(ctx, result.files)
-            # Also scan failed files for blocked extensions
-            failed_files = [FileAttachment(name, b"") for name in result.failed_files]
-            blocked.extend(self._filter_files(ctx, failed_files).blocked)
-            # Add notice if any files were blocked
-            if blocked:
-                blocked_sorted = sorted(set(f.suffix for f in blocked))
-                # Only no extension
-                if len(blocked_sorted) == 1 and blocked_sorted[0] == "":
-                    blocked_msg = "Files with no extension can't be uploaded."
-                # Both
-                elif "" in blocked_sorted:
-                    blocked_str = ", ".join(ext for ext in blocked_sorted if ext)
-                    blocked_msg = (
-                        f"Files with no extension or disallowed extensions can't be uploaded: **{blocked_str}**"
-                    )
-                else:
-                    blocked_str = ", ".join(blocked_sorted)
-                    blocked_msg = f"Files with disallowed extensions can't be uploaded: **{blocked_str}**"
-
-                msg += f"\n{Emojis.failed_file} {blocked_msg}"
-
             # Split text files
-            text_files = [f for f in allowed if f.suffix in TXT_LIKE_FILES]
-            # Inline until budget, then upload to paste service
-            # Budget is shared with stdout, so subtract what we've already used
-            budget_lines = MAX_OUTPUT_BLOCK_LINES - (output.count("\n") + 1)
-            budget_chars = MAX_OUTPUT_BLOCK_CHARS - len(output)
-            for file in text_files:
-                file_text = file.content.decode("utf-8", errors="replace") or "[Empty]"
-                # Override to always allow 1 line and <= 50 chars, since this is less than a link
-                if len(file_text) <= 50 and not file_text.count("\n"):
-                    msg += f"\n`{file.name}`\n```\n{file_text}\n```"
-                # otherwise, use budget
-                else:
-                    format_text, link_text = await self.format_output(
-                        file_text,
-                        budget_lines,
-                        budget_chars,
-                        line_nums=False,
-                        output_default="[Empty]"
-                    )
-                    # With any link, use it (don't use budget)
-                    if link_text:
-                        msg += f"\n`{file.name}`\n{link_text}"
-                    else:
-                        msg += f"\n`{file.name}`\n```\n{format_text}\n```"
-                        budget_lines -= format_text.count("\n") + 1
-                        budget_chars -= len(file_text)
+            text_files = [f for f in result.files if f.suffix in TXT_LIKE_FILES]
+            msg += await self.format_file_text(text_files, output)
 
             filter_cog: Filtering | None = self.bot.get_cog("Filtering")
-            if filter_cog and (await filter_cog.filter_snekbox_output(msg, ctx.message)):
-                return await ctx.send("Attempt to circumvent filter detected. Moderator team has been alerted.")
+            blocked_exts = set()
+            # Include failed files in the scan.
+            failed_files = [FileAttachment(name, b"") for name in result.failed_files]
+            total_files = result.files + failed_files
+            if filter_cog:
+                block_output, blocked_exts = await filter_cog.filter_snekbox_output(msg, total_files, ctx.message)
+                if block_output:
+                    return await ctx.send("Attempt to circumvent filter detected. Moderator team has been alerted.")
+
+            # Filter file extensions
+            allowed, blocked = self._filter_files(ctx, result.files, blocked_exts)
+            blocked.extend(self._filter_files(ctx, failed_files, blocked_exts).blocked)
+            if blocked:
+                msg += self.format_blocked_extensions(blocked)
 
             # Upload remaining non-text files
             files = [f.to_file() for f in allowed if f not in text_files]
             allowed_mentions = AllowedMentions(everyone=False, roles=False, users=[ctx.author])
             view = self.build_python_version_switcher_view(job.version, ctx, job)
-            response = await ctx.send(msg, allowed_mentions=allowed_mentions, view=view, files=files)
+
+            if ctx.message.channel == ctx.channel:
+                # Don't fail if the command invoking message was deleted.
+                message = ctx.message.to_reference(fail_if_not_exists=False)
+                response = await ctx.send(
+                    msg,
+                    allowed_mentions=allowed_mentions,
+                    view=view,
+                    files=files,
+                    reference=message
+                )
+            else:
+                # The command was redirected so a reply wont work, send a normal message with a mention.
+                msg = f"{ctx.author.mention} {msg}"
+                response = await ctx.send(msg, allowed_mentions=allowed_mentions, view=view, files=files)
             view.message = response
 
             log.info(f"{ctx.author}'s {job.name} job had a return code of {result.returncode}")
@@ -445,13 +472,13 @@ class Snekbox(Cog):
         with contextlib.suppress(NotFound):
             try:
                 _, new_message = await self.bot.wait_for(
-                    'message_edit',
+                    "message_edit",
                     check=_predicate_message_edit,
                     timeout=REDO_TIMEOUT
                 )
                 await ctx.message.add_reaction(REDO_EMOJI)
                 await self.bot.wait_for(
-                    'reaction_add',
+                    "reaction_add",
                     check=_predicate_emoji_reaction,
                     timeout=10
                 )
@@ -469,7 +496,7 @@ class Snekbox(Cog):
                 if code is None:
                     return None
 
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 with contextlib.suppress(HTTPException):
                     await ctx.message.clear_reaction(REDO_EMOJI)
                 return None
@@ -478,12 +505,11 @@ class Snekbox(Cog):
 
             if job_name == "timeit":
                 return EvalJob(self.prepare_timeit_input(codeblocks))
-            else:
-                return EvalJob.from_code("\n".join(codeblocks))
+            return EvalJob.from_code("\n".join(codeblocks))
 
         return None
 
-    async def get_code(self, message: Message, command: Command) -> Optional[str]:
+    async def get_code(self, message: Message, command: Command) -> str | None:
         """
         Return the code from `message` to be evaluated.
 
@@ -555,7 +581,7 @@ class Snekbox(Cog):
     async def eval_command(
         self,
         ctx: Context,
-        python_version: PythonVersion | None,
+        python_version: SupportedPythonVersions | None,
         *,
         code: CodeblockConverter
     ) -> None:
@@ -572,13 +598,13 @@ class Snekbox(Cog):
         If multiple codeblocks are in a message, all of them will be joined and evaluated,
         ignoring the text outside them.
 
-        By default, your code is run on Python 3.11. A `python_version` arg of `3.10` can also be specified.
+        Currently only 3.12 version is supported.
 
         We've done our best to make this sandboxed, but do let us know if you manage to find an
         issue with it!
         """
         code: list[str]
-        python_version = python_version or "3.11"
+        python_version = python_version or "3.12"
         job = EvalJob.from_code("\n".join(code)).as_version(python_version)
         await self.run_job(ctx, job)
 
@@ -594,7 +620,7 @@ class Snekbox(Cog):
     async def timeit_command(
         self,
         ctx: Context,
-        python_version: PythonVersion | None,
+        python_version: SupportedPythonVersions | None,
         *,
         code: CodeblockConverter
     ) -> None:
@@ -608,13 +634,13 @@ class Snekbox(Cog):
         If multiple formatted codeblocks are provided, the first one will be the setup code, which will
         not be timed. The remaining codeblocks will be joined together and timed.
 
-        By default, your code is run on Python 3.11. A `python_version` arg of `3.10` can also be specified.
+        Currently only 3.12 version is supported.
 
         We've done our best to make this sandboxed, but do let us know if you manage to find an
         issue with it!
         """
         code: list[str]
-        python_version = python_version or "3.11"
+        python_version = python_version or "3.12"
         args = self.prepare_timeit_input(code)
         job = EvalJob(args, version=python_version, name="timeit")
 

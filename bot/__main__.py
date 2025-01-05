@@ -13,7 +13,6 @@ from bot import constants
 from bot.bot import Bot
 from bot.log import get_logger, setup_sentry
 
-setup_sentry()
 LOCALHOST = "127.0.0.1"
 
 
@@ -23,7 +22,6 @@ async def _create_redis_session() -> RedisSession:
         host=constants.Redis.host,
         port=constants.Redis.port,
         password=constants.Redis.password,
-        max_connections=20,
         use_fakeredis=constants.Redis.use_fakeredis,
         global_namespace="bot",
         decode_responses=True,
@@ -36,6 +34,8 @@ async def _create_redis_session() -> RedisSession:
 
 async def main() -> None:
     """Entry async method for starting the bot."""
+    setup_sentry()
+
     statsd_url = constants.Stats.statsd_host
     if constants.DEBUG_MODE:
         # Since statsd is UDP, there are no errors for sending to a down port.
@@ -66,7 +66,7 @@ async def main() -> None:
             intents=intents,
             allowed_roles=list({discord.Object(id_) for id_ in constants.MODERATION_ROLES}),
             api_client=APIClient(
-                site_api_url=f"{constants.URLs.site_api_schema}{constants.URLs.site_api}",
+                site_api_url=constants.URLs.site_api,
                 site_api_token=constants.Keys.site_api,
             ),
         )
@@ -78,7 +78,7 @@ try:
     asyncio.run(main())
 except StartupError as e:
     message = "Unknown Startup Error Occurred."
-    if isinstance(e.exception, (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError)):
+    if isinstance(e.exception, aiohttp.ClientConnectorError | aiohttp.ServerDisconnectedError):
         message = "Could not connect to site API. Is it running?"
     elif isinstance(e.exception, OSError):
         message = "Could not connect to Redis. Is it running?"

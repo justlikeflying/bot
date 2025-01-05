@@ -2,17 +2,21 @@ import colorsys
 import pprint
 import textwrap
 from collections import defaultdict
+from collections.abc import Mapping
 from textwrap import shorten
-from typing import Any, DefaultDict, Mapping, Optional, Set, TYPE_CHECKING, Tuple, Union
+from typing import Any, TYPE_CHECKING
 
 import rapidfuzz
 from discord import AllowedMentions, Colour, Embed, Guild, Message, Role
-from discord.ext.commands import BucketType, Cog, Context, Paginator, command, group, has_any_role
+from discord.ext.commands import BucketType, Cog, Context, command, group, has_any_role
 from discord.utils import escape_markdown
 from pydis_core.site_api import ResponseCodeError
+from pydis_core.utils.members import get_or_fetch_member
+from pydis_core.utils.paste_service import PasteFile, PasteTooLongError, PasteUploadError, send_to_paste_service
 
 from bot import constants
 from bot.bot import Bot
+from bot.constants import BaseURLs, Emojis
 from bot.converters import MemberOrUser
 from bot.decorators import in_whitelist
 from bot.errors import NonExistentRoleError
@@ -21,7 +25,7 @@ from bot.pagination import LinePaginator
 from bot.utils import time
 from bot.utils.channel import is_mod_channel, is_staff_channel
 from bot.utils.checks import cooldown_with_role_bypass, has_no_roles_check, in_whitelist_check
-from bot.utils.members import get_or_fetch_member
+from bot.utils.messages import send_denial
 
 log = get_logger(__name__)
 
@@ -44,7 +48,7 @@ class Information(Cog):
         self.bot = bot
 
     @staticmethod
-    def get_channel_type_counts(guild: Guild) -> DefaultDict[str, int]:
+    def get_channel_type_counts(guild: Guild) -> defaultdict[str, int]:
         """Return the total amounts of the various types of channels in `guild`."""
         channel_counter = defaultdict(int)
 
@@ -57,7 +61,7 @@ class Information(Cog):
         return channel_counter
 
     @staticmethod
-    def join_role_stats(role_ids: list[int], guild: Guild, name: Optional[str] = None) -> dict[str, int]:
+    def join_role_stats(role_ids: list[int], guild: Guild, name: str | None = None) -> dict[str, int]:
         """Return a dictionary with the number of `members` of each role given, and the `name` for this joined group."""
         member_count = 0
         for role_id in role_ids:
@@ -134,7 +138,7 @@ class Information(Cog):
 
     @has_any_role(*constants.STAFF_PARTNERS_COMMUNITY_ROLES)
     @command(name="role")
-    async def role_info(self, ctx: Context, *roles: Union[Role, str]) -> None:
+    async def role_info(self, ctx: Context, *roles: Role | str) -> None:
         """
         Return information on a role or list of roles.
 
@@ -237,7 +241,7 @@ class Information(Cog):
         await ctx.send(embed=embed)
 
     @command(name="user", aliases=["user_info", "member", "member_info", "u"])
-    async def user_info(self, ctx: Context, user_or_message: Union[MemberOrUser, Message] = None) -> None:
+    async def user_info(self, ctx: Context, user_or_message: MemberOrUser | Message = None) -> None:
         """Returns info about a user."""
         if passed_as_message := isinstance(user_or_message, Message):
             user = user_or_message.author
@@ -319,6 +323,7 @@ class Information(Cog):
         if is_mod_channel(ctx.channel):
             fields.append(await self.expanded_user_infraction_counts(user))
             fields.append(await self.user_nomination_counts(user))
+            fields.append(await self.user_alt_count(user))
         else:
             fields.append(await self.basic_user_infraction_counts(user))
 
@@ -336,24 +341,38 @@ class Information(Cog):
 
         return embed
 
-    async def basic_user_infraction_counts(self, user: MemberOrUser) -> Tuple[str, str]:
+    async def user_alt_count(self, user: MemberOrUser) -> tuple[str, int | str]:
+        """Get the number of alts for the given member."""
+        try:
+            resp = await self.bot.api_client.get(f"bot/users/{user.id}")
+            return ("Associated accounts", len(resp["alts"]) or "No associated accounts")
+        except ResponseCodeError as e:
+            # If user is not found, return a soft-error regarding this.
+            if e.response.status == 404:
+                return ("Associated accounts", "User not found in site database.")
+
+            # If we have any other issue, re-raise the exception
+            raise e
+
+
+    async def basic_user_infraction_counts(self, user: MemberOrUser) -> tuple[str, str]:
         """Gets the total and active infraction counts for the given `member`."""
         infractions = await self.bot.api_client.get(
-            'bot/infractions',
+            "bot/infractions",
             params={
-                'hidden': 'False',
-                'user__id': str(user.id)
+                "hidden": "False",
+                "user__id": str(user.id)
             }
         )
 
         total_infractions = len(infractions)
-        active_infractions = sum(infraction['active'] for infraction in infractions)
+        active_infractions = sum(infraction["active"] for infraction in infractions)
 
         infraction_output = f"Total: {total_infractions}\nActive: {active_infractions}"
 
         return "Infractions", infraction_output
 
-    async def expanded_user_infraction_counts(self, user: MemberOrUser) -> Tuple[str, str]:
+    async def expanded_user_infraction_counts(self, user: MemberOrUser) -> tuple[str, str]:
         """
         Gets expanded infraction counts for the given `member`.
 
@@ -361,9 +380,9 @@ class Information(Cog):
         in the output as well.
         """
         infractions = await self.bot.api_client.get(
-            'bot/infractions',
+            "bot/infractions",
             params={
-                'user__id': str(user.id)
+                "user__id": str(user.id)
             }
         )
 
@@ -376,7 +395,7 @@ class Information(Cog):
             infraction_counter = defaultdict(int)
             for infraction in infractions:
                 infraction_type = infraction["type"]
-                infraction_active = 'active' if infraction["active"] else 'inactive'
+                infraction_active = "active" if infraction["active"] else "inactive"
 
                 infraction_types.add(infraction_type)
                 infraction_counter[f"{infraction_active} {infraction_type}"] += 1
@@ -394,12 +413,12 @@ class Information(Cog):
 
         return "Infractions", "\n".join(infraction_output)
 
-    async def user_nomination_counts(self, user: MemberOrUser) -> Tuple[str, str]:
+    async def user_nomination_counts(self, user: MemberOrUser) -> tuple[str, str]:
         """Gets the active and historical nomination counts for the given `member`."""
         nominations = await self.bot.api_client.get(
-            'bot/nominations',
+            "bot/nominations",
             params={
-                'user__id': str(user.id)
+                "user__id": str(user.id)
             }
         )
 
@@ -419,7 +438,7 @@ class Information(Cog):
 
         return "Nominations", "\n".join(output)
 
-    async def user_messages(self, user: MemberOrUser) -> Tuple[Union[bool, str], Tuple[str, str]]:
+    async def user_messages(self, user: MemberOrUser) -> tuple[str, str]:
         """
         Gets the amount of messages for `member`.
 
@@ -434,16 +453,23 @@ class Information(Cog):
             if e.status == 404:
                 activity_output = "No activity"
         else:
-            activity_output.append(f"{user_activity['total_messages']:,}" or "No messages")
-            activity_output.append(f"{user_activity['activity_blocks']:,}" or "No activity")
+            total_message_text = (
+                f"{user_activity['total_messages']:,}" if user_activity["total_messages"] else "No messages"
+            )
+            activity_blocks_text = (
+                f"{user_activity['activity_blocks']:,}" if user_activity["activity_blocks"] else "No activity"
+            )
+            activity_output.append(total_message_text)
+            activity_output.append(activity_blocks_text)
 
             activity_output = "\n".join(
-                f"{name}: {metric}" for name, metric in zip(["Messages", "Activity blocks"], activity_output)
+                f"{name}: {metric}"
+                for name, metric in zip(["Messages", "Activity blocks"], activity_output, strict=True)
             )
 
-        return ("Activity", activity_output)
+        return "Activity", activity_output
 
-    def format_fields(self, mapping: Mapping[str, Any], field_width: Optional[int] = None) -> str:
+    def format_fields(self, mapping: Mapping[str, Any], field_width: int | None = None) -> str:
         """Format a mapping to be readable to a human."""
         # sorting is technically superfluous but nice if you want to look for a specific field
         fields = sorted(mapping.items(), key=lambda item: item[0])
@@ -451,29 +477,29 @@ class Information(Cog):
         if field_width is None:
             field_width = len(max(mapping.keys(), key=len))
 
-        out = ''
+        out = ""
 
         for key, val in fields:
             if isinstance(val, dict):
                 # if we have dicts inside dicts we want to apply the same treatment to the inner dictionaries
                 inner_width = int(field_width * 1.6)
-                val = '\n' + self.format_fields(val, field_width=inner_width)
+                val = "\n" + self.format_fields(val, field_width=inner_width)
 
             elif isinstance(val, str):
                 # split up text since it might be long
                 text = textwrap.fill(val, width=100, replace_whitespace=False)
 
                 # indent it, I guess you could do this with `wrap` and `join` but this is nicer
-                val = textwrap.indent(text, ' ' * (field_width + len(': ')))
+                val = textwrap.indent(text, " " * (field_width + len(": ")))
 
                 # the first line is already indented so we `str.lstrip` it
                 val = val.lstrip()
 
-            if key == 'color':
+            if key == "color":
                 # makes the base 10 representation of a hex number readable to humans
                 val = hex(val)
 
-            out += '{0:>{width}}: {1}\n'.format(key, val, width=field_width)
+            out += "{0:>{width}}: {1}\n".format(key, val, width=field_width)
 
         # remove trailing whitespace
         return out.rstrip()
@@ -492,20 +518,19 @@ class Information(Cog):
         # doing this extra request is also much easier than trying to convert everything back into a dictionary again
         raw_data = await ctx.bot.http.get_message(message.channel.id, message.id)
 
-        paginator = Paginator()
+        lines = []
 
         def add_content(title: str, content: str) -> None:
-            paginator.add_line(f'== {title} ==\n')
+            lines.append(f"== {title} ==\n")
             # Replace backticks as it breaks out of code blocks.
-            # An invisible character seemed to be the most reasonable solution. We hope it's not close to 2000.
-            paginator.add_line(content.replace('`', '`\u200b'))
-            paginator.close_page()
+            # An invisible character seemed to be the most reasonable solution.
+            lines.append(content.replace("`", "`\u200b"))
 
         if message.content:
-            add_content('Raw message', message.content)
+            add_content("Raw message", message.content)
 
         transformer = pprint.pformat if json else self.format_fields
-        for field_name in ('embeds', 'attachments'):
+        for field_name in ("embeds", "attachments"):
             data = raw_data[field_name]
 
             if not data:
@@ -513,22 +538,57 @@ class Information(Cog):
 
             total = len(data)
             for current, item in enumerate(data, start=1):
-                title = f'Raw {field_name} ({current}/{total})'
+                title = f"Raw {field_name} ({current}/{total})"
                 add_content(title, transformer(item))
 
-        for page in paginator.pages:
-            await ctx.send(page, allowed_mentions=AllowedMentions.none())
+        output = "\n".join(lines)
+        if len(output) < 2000-8:  # To cover the backticks and newlines added below.
+            await ctx.send(f"```\n{output}\n```", allowed_mentions=AllowedMentions.none())
+            return
+
+        file = PasteFile(content=output, lexer="text")
+        try:
+            resp = await send_to_paste_service(
+                files=[file],
+                http_session=self.bot.http_session,
+                paste_url=BaseURLs.paste_url,
+            )
+            message = f"Message was too long for Discord, posted the output to [our pastebin]({resp.link})."
+        except PasteTooLongError:
+            message = f"{Emojis.cross_mark} Too long to upload to paste service."
+        except PasteUploadError:
+            message = f"{Emojis.cross_mark} Failed to upload to paste service."
+
+        await ctx.send(message)
 
     @cooldown_with_role_bypass(2, 60 * 3, BucketType.member, bypass_roles=constants.STAFF_PARTNERS_COMMUNITY_ROLES)
     @group(invoke_without_command=True)
     @in_whitelist(channels=(constants.Channels.bot_commands,), roles=constants.STAFF_PARTNERS_COMMUNITY_ROLES)
-    async def raw(self, ctx: Context, message: Message) -> None:
+    async def raw(self, ctx: Context, message: Message | None = None) -> None:
         """Shows information about the raw API response."""
+        if message is None:
+            if (reference := ctx.message.reference) and isinstance(reference.resolved, Message):
+                message = reference.resolved
+            else:
+                await send_denial(
+                    ctx, "Missing message argument. Please provide a message ID/link or reply to a message."
+                )
+                return
+
         await self.send_raw_content(ctx, message)
 
     @raw.command()
-    async def json(self, ctx: Context, message: Message) -> None:
+    async def json(self, ctx: Context, message: Message | None = None) -> None:
         """Shows information about the raw API response in a copy-pasteable Python format."""
+        if message is None:
+            if (reference := ctx.message.reference) and isinstance(reference.resolved, Message):
+                message = reference.resolved
+            else:
+                await send_denial(
+                    ctx, "Missing message argument. Please provide a message ID/link or reply to a message."
+                )
+                return
+
         await self.send_raw_content(ctx, message, json=True)
 
     async def _set_rules_command_help(self) -> None:
@@ -543,7 +603,7 @@ class Information(Cog):
         self.rules.help = help_string
 
     @command(aliases=("rule",))
-    async def rules(self, ctx: Context, *, args: Optional[str]) -> Optional[Set[int]]:
+    async def rules(self, ctx: Context, *, args: str | None) -> set[int] | None:
         """
         Provides a link to all rules or, if specified, displays specific rule(s).
 
@@ -574,7 +634,7 @@ class Information(Cog):
             # Neither rules nor keywords were submitted. Return the default description.
             rules_embed.description = DEFAULT_RULES_DESCRIPTION
             await ctx.send(embed=rules_embed)
-            return
+            return None
 
         # Remove duplicates and sort the rule indices
         rule_numbers = sorted(set(rule_numbers))
@@ -585,7 +645,7 @@ class Information(Cog):
 
         if invalid:
             await ctx.send(shorten(":x: Invalid rule indices: " + invalid, 75, placeholder=" ..."))
-            return
+            return None
 
         final_rules = []
         final_rule_numbers = {keyword_to_rule_number[keyword] for keyword in keywords}
