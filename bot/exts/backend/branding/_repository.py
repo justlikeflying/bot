@@ -1,11 +1,13 @@
 import typing as t
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 
 import frontmatter
+from aiohttp import ClientResponse, ClientResponseError
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from bot.bot import Bot
 from bot.constants import Keys
-from bot.errors import BrandingMisconfiguration
+from bot.errors import BrandingMisconfigurationError
 from bot.log import get_logger
 
 # Base URL for requests into the branding repository.
@@ -39,9 +41,9 @@ class RemoteObject:
     name: str  # Filename.
     path: str  # Path from repo root.
     type: str  # Either 'file' or 'dir'.
-    download_url: t.Optional[str]  # If type is 'dir', this is None!
+    download_url: str | None  # If type is 'dir', this is None!
 
-    def __init__(self, dictionary: t.Dict[str, t.Any]) -> None:
+    def __init__(self, dictionary: dict[str, t.Any]) -> None:
         """Initialize by grabbing annotated attributes from `dictionary`."""
         missing_keys = self.__annotations__.keys() - dictionary.keys()
         if missing_keys:
@@ -54,8 +56,8 @@ class MetaFile(t.NamedTuple):
     """Attributes defined in a 'meta.md' file."""
 
     is_fallback: bool
-    start_date: t.Optional[date]
-    end_date: t.Optional[date]
+    start_date: date | None
+    end_date: date | None
     description: str  # Markdown event description.
 
 
@@ -69,6 +71,35 @@ class Event(t.NamedTuple):
 
     def __str__(self) -> str:
         return f"<Event at '{self.path}'>"
+
+
+class GitHubServerError(Exception):
+    """
+    GitHub responded with 5xx status code.
+
+    Such error shall be retried.
+    """
+
+
+def _raise_for_status(resp: ClientResponse) -> None:
+    """Raise custom error if resp status is 5xx."""
+    # Use the response's raise_for_status so that we can
+    # attach the full traceback to our custom error.
+    log.trace(f"GitHub response status: {resp.status}")
+    try:
+        resp.raise_for_status()
+    except ClientResponseError as err:
+        if resp.status >= 500:
+            raise GitHubServerError from err
+        raise
+
+
+_retry_server_error = retry(
+    retry=retry_if_exception_type(GitHubServerError),  # Only retry this error.
+    stop=stop_after_attempt(5),  # Up to 5 attempts.
+    wait=wait_exponential(),  # Exponential backoff: 1, 2, 4, 8 seconds.
+    reraise=True,  # After final failure, re-raise original exception.
+)
 
 
 class BrandingRepository:
@@ -93,7 +124,8 @@ class BrandingRepository:
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
 
-    async def fetch_directory(self, path: str, types: t.Container[str] = ("file", "dir")) -> t.Dict[str, RemoteObject]:
+    @_retry_server_error
+    async def fetch_directory(self, path: str, types: t.Container[str] = ("file", "dir")) -> dict[str, RemoteObject]:
         """
         Fetch directory found at `path` in the branding repository.
 
@@ -105,14 +137,12 @@ class BrandingRepository:
         log.debug(f"Fetching directory from branding repository: '{full_url}'.")
 
         async with self.bot.http_session.get(full_url, params=PARAMS, headers=HEADERS) as response:
-            if response.status != 200:
-                raise RuntimeError(f"Failed to fetch directory due to status: {response.status}")
-
-            log.debug("Fetch successful, reading JSON response.")
+            _raise_for_status(response)
             json_directory = await response.json()
 
         return {file["name"]: RemoteObject(file) for file in json_directory if file["type"] in types}
 
+    @_retry_server_error
     async def fetch_file(self, download_url: str) -> bytes:
         """
         Fetch file as bytes from `download_url`.
@@ -122,10 +152,7 @@ class BrandingRepository:
         log.debug(f"Fetching file from branding repository: '{download_url}'.")
 
         async with self.bot.http_session.get(download_url, params=PARAMS, headers=HEADERS) as response:
-            if response.status != 200:
-                raise RuntimeError(f"Failed to fetch file due to status: {response.status}")
-
-            log.debug("Fetch successful, reading payload.")
+            _raise_for_status(response)
             return await response.read()
 
     def parse_meta_file(self, raw_file: bytes) -> MetaFile:
@@ -137,7 +164,7 @@ class BrandingRepository:
         attrs, description = frontmatter.parse(raw_file, encoding="UTF-8")
 
         if not description:
-            raise BrandingMisconfiguration("No description found in 'meta.md'!")
+            raise BrandingMisconfigurationError("No description found in 'meta.md'!")
 
         if attrs.get("fallback", False):
             return MetaFile(is_fallback=True, start_date=None, end_date=None, description=description)
@@ -146,12 +173,12 @@ class BrandingRepository:
         end_date_raw = attrs.get("end_date")
 
         if None in (start_date_raw, end_date_raw):
-            raise BrandingMisconfiguration("Non-fallback event doesn't have start and end dates defined!")
+            raise BrandingMisconfigurationError("Non-fallback event doesn't have start and end dates defined!")
 
         # We extend the configured month & day with an arbitrary leap year, allowing a datetime object to exist.
         # This may raise errors if misconfigured. We let the caller handle such cases.
-        start_date = datetime.strptime(f"{start_date_raw} {ARBITRARY_YEAR}", DATE_FMT).date()
-        end_date = datetime.strptime(f"{end_date_raw} {ARBITRARY_YEAR}", DATE_FMT).date()
+        start_date = datetime.strptime(f"{start_date_raw} {ARBITRARY_YEAR}", DATE_FMT).replace(tzinfo=UTC).date()
+        end_date = datetime.strptime(f"{end_date_raw} {ARBITRARY_YEAR}", DATE_FMT).replace(tzinfo=UTC).date()
 
         return MetaFile(is_fallback=False, start_date=start_date, end_date=end_date, description=description)
 
@@ -166,15 +193,15 @@ class BrandingRepository:
         missing_assets = {"meta.md", "server_icons", "banners"} - contents.keys()
 
         if missing_assets:
-            raise BrandingMisconfiguration(f"Directory is missing following assets: {missing_assets}")
+            raise BrandingMisconfigurationError(f"Directory is missing following assets: {missing_assets}")
 
         server_icons = await self.fetch_directory(contents["server_icons"].path, types=("file",))
         banners = await self.fetch_directory(contents["banners"].path, types=("file",))
 
         if len(server_icons) == 0:
-            raise BrandingMisconfiguration("Found no server icons!")
+            raise BrandingMisconfigurationError("Found no server icons!")
         if len(banners) == 0:
-            raise BrandingMisconfiguration("Found no server banners!")
+            raise BrandingMisconfigurationError("Found no server banners!")
 
         meta_bytes = await self.fetch_file(contents["meta.md"].download_url)
 
@@ -182,43 +209,40 @@ class BrandingRepository:
 
         return Event(directory.path, meta_file, list(banners.values()), list(server_icons.values()))
 
-    async def get_events(self) -> t.List[Event]:
+    async def get_events(self) -> list[Event]:
         """
         Discover available events in the branding repository.
 
-        Misconfigured events are skipped. May return an empty list in the catastrophic case.
+        Propagate errors if an event fails to fetch or deserialize.
         """
         log.debug("Discovering events in branding repository.")
 
-        try:
-            event_directories = await self.fetch_directory("events", types=("dir",))  # Skip files.
-        except Exception:
-            log.exception("Failed to fetch 'events' directory.")
-            return []
+        event_directories = await self.fetch_directory("events", types=("dir",))  # Skip files.
 
-        instances: t.List[Event] = []
+        instances: list[Event] = []
 
         for event_directory in event_directories.values():
-            log.trace(f"Attempting to construct event from directory: '{event_directory.path}'.")
-            try:
-                instance = await self.construct_event(event_directory)
-            except Exception as exc:
-                log.warning(f"Could not construct event '{event_directory.path}'.", exc_info=exc)
-            else:
-                instances.append(instance)
+            log.trace(f"Reading event directory: '{event_directory.path}'.")
+            instance = await self.construct_event(event_directory)
+            instances.append(instance)
 
         return instances
 
-    async def get_current_event(self) -> t.Tuple[t.Optional[Event], t.List[Event]]:
+    async def get_current_event(self) -> tuple[Event, list[Event]]:
         """
         Get the currently active event, or the fallback event.
 
         The second return value is a list of all available events. The caller may discard it, if not needed.
         Returning all events alongside the current one prevents having to query the API twice in some cases.
 
-        The current event may be None in the case that no event is active, and no fallback event is found.
+        Raise an error in the following cases:
+          * GitHub request fails
+          * The branding repo contains an invalid event
+          * No event is active and the fallback event is missing
+
+        Events are validated in the branding repo. The bot assumes that events are valid.
         """
-        utc_now = datetime.utcnow()
+        utc_now = datetime.now(tz=UTC)
         log.debug(f"Finding active event for: {utc_now}.")
 
         # Construct an object in the arbitrary year for the purpose of comparison.
@@ -230,7 +254,17 @@ class BrandingRepository:
 
         for event in available_events:
             meta = event.meta
-            if not meta.is_fallback and (meta.start_date <= lookup_now <= meta.end_date):
+            if meta.is_fallback:
+                continue
+
+            start_date, end_date = meta.start_date, meta.end_date
+
+            # Case where the event starts and ends in the same year.
+            if start_date <= lookup_now <= end_date:
+                return event, available_events
+
+            # Case where the event spans across two years.
+            if start_date > end_date and (lookup_now >= start_date or lookup_now <= end_date):
                 return event, available_events
 
         log.trace("No active event found. Looking for fallback event.")
@@ -239,5 +273,4 @@ class BrandingRepository:
             if event.meta.is_fallback:
                 return event, available_events
 
-        log.warning("No event is currently active and no fallback event was found!")
-        return None, available_events
+        raise BrandingMisconfigurationError("No event is active and the fallback event is missing!")

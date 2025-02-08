@@ -1,5 +1,4 @@
 import time
-from typing import Optional
 
 import discord
 from discord import Message, RawMessageUpdateEvent
@@ -8,8 +7,8 @@ from pydis_core.utils import scheduling
 
 from bot import constants
 from bot.bot import Bot
-from bot.exts.filters.token_remover import TokenRemover
-from bot.exts.filters.webhook_remover import WEBHOOK_URL_RE
+from bot.exts.filtering._filters.unique.discord_token import DiscordTokenFilter
+from bot.exts.filtering._filters.unique.webhook import WEBHOOK_URL_RE
 from bot.exts.help_channels._channel import is_help_forum_post
 from bot.exts.info.codeblock._instructions import get_instructions
 from bot.log import get_logger
@@ -44,8 +43,7 @@ class CodeBlockCog(Cog, name="Code Block"):
     When an issue is detected, an embed is sent containing specific instructions on fixing what
     is wrong. If the user edits their message to fix the code block, the instructions will be
     removed. If they fail to fix the code block with an edit, the instructions will be updated to
-    show what is still incorrect after the user's edit. The embed can be manually deleted with a
-    reaction. Otherwise, it will automatically be removed after 5 minutes.
+    show what is still incorrect after the user's edit. Otherwise, it will automatically be removed after 5 minutes.
 
     The cog only detects messages in whitelisted channels. Channels may also have a cooldown on the
     instructions being sent. Note all help channels are also whitelisted with cooldowns enabled.
@@ -65,9 +63,9 @@ class CodeBlockCog(Cog, name="Code Block"):
     @staticmethod
     def create_embed(instructions: str) -> discord.Embed:
         """Return an embed which displays code block formatting `instructions`."""
-        return discord.Embed(description=instructions)
+        return discord.Embed(description=instructions, title="Please edit your message to use a code block")
 
-    async def get_sent_instructions(self, payload: RawMessageUpdateEvent) -> Optional[Message]:
+    async def get_sent_instructions(self, payload: RawMessageUpdateEvent) -> Message | None:
         """
         Return the bot's sent instructions message associated with a user's message `payload`.
 
@@ -115,7 +113,7 @@ class CodeBlockCog(Cog, name="Code Block"):
         bot_message = await message.channel.send(f"Hey {message.author.mention}!", embed=embed)
         self.codeblock_message_ids[message.id] = bot_message.id
 
-        scheduling.create_task(wait_for_deletion(bot_message, (message.author.id,)), event_loop=self.bot.loop)
+        scheduling.create_task(wait_for_deletion(bot_message, tuple(), attach_emojis=False))
 
         # Increase amount of codeblock correction in stats
         self.bot.stats.incr("codeblock_corrections")
@@ -135,7 +133,7 @@ class CodeBlockCog(Cog, name="Code Block"):
             not message.author.bot
             and self.is_valid_channel(message.channel)
             and has_lines(message.content, constants.CodeBlock.minimum_lines)
-            and not TokenRemover.find_token_in_message(message)
+            and not DiscordTokenFilter.find_token_in_message(message.content)
             and not WEBHOOK_URL_RE.search(message.content)
         )
 

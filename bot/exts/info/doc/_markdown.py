@@ -31,7 +31,7 @@ class DocMarkdownConverter(markdownify.MarkdownConverter):
             bullet = bullets[depth % len(bullets)]
         return f"{bullet} {text}\n"
 
-    def convert_hn(self, _n: int, el: PageElement, text: str, convert_as_inline: bool) -> str:
+    def _convert_hn(self, _n: int, el: PageElement, text: str, convert_as_inline: bool) -> str:
         """Convert h tags to bold text with ** instead of adding #."""
         if convert_as_inline:
             return text
@@ -49,6 +49,8 @@ class DocMarkdownConverter(markdownify.MarkdownConverter):
     def convert_a(self, el: PageElement, text: str, convert_as_inline: bool) -> str:
         """Resolve relative URLs to `self.page_url`."""
         el["href"] = urljoin(self.page_url, el["href"])
+        # Discord doesn't handle titles properly, showing links with them as raw text.
+        el["title"] = None
         return super().convert_a(el, text, convert_as_inline)
 
     def convert_p(self, el: PageElement, text: str, convert_as_inline: bool) -> str:

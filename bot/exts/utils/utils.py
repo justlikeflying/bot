@@ -1,7 +1,6 @@
 import difflib
 import re
 import unicodedata
-from typing import Tuple
 
 from discord import Colour, Embed, utils
 from discord.ext.commands import BadArgument, Cog, Context, clean_content, command, has_any_role
@@ -65,23 +64,23 @@ class Utils(Cog):
             await messages.send_denial(ctx, f"Too many characters ({len(characters)}/50)")
             return
 
-        def get_info(char: str) -> Tuple[str, str]:
+        def get_info(char: str) -> tuple[str, str]:
             digit = f"{ord(char):x}"
             if len(digit) <= 4:
                 u_code = f"\\u{digit:>04}"
             else:
                 u_code = f"\\U{digit:>08}"
             url = f"https://www.compart.com/en/unicode/U+{digit:>04}"
-            name = f"[{unicodedata.name(char, '')}]({url})"
+            name = f"[{unicodedata.name(char, 'Name not found')}]({url})"
             info = f"`{u_code.ljust(10)}`: {name} - {utils.escape_markdown(char)}"
             return info, u_code
 
-        char_list, raw_list = zip(*(get_info(c) for c in characters))
+        char_list, raw_list = zip(*(get_info(c) for c in characters), strict=True)
         embed = Embed().set_author(name="Character Info")
 
         if len(characters) > 1:
             # Maximum length possible is 502 out of 1024, so there's no need to truncate.
-            embed.add_field(name='Full Raw Text', value=f"`{''.join(raw_list)}`", inline=False)
+            embed.add_field(name="Full Raw Text", value=f"`{''.join(raw_list)}`", inline=False)
 
         await LinePaginator.paginate(char_list, ctx, embed, max_lines=10, max_size=2000, empty=False)
 

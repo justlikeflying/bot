@@ -1,11 +1,11 @@
 import abc
 import typing as t
 from collections import namedtuple
+from itertools import batched
 
 import discord.errors
 from discord import Guild
 from discord.ext.commands import Context
-from more_itertools import chunked
 from pydis_core.site_api import ResponseCodeError
 
 import bot
@@ -17,8 +17,8 @@ CHUNK_SIZE = 1000
 
 # These objects are declared as namedtuples because tuples are hashable,
 # something that we make use of when diffing site roles against guild roles.
-_Role = namedtuple('Role', ('id', 'name', 'colour', 'permissions', 'position'))
-_Diff = namedtuple('Diff', ('created', 'updated', 'deleted'))
+_Role = namedtuple("Role", ("id", "name", "colour", "permissions", "position"))
+_Diff = namedtuple("Diff", ("created", "updated", "deleted"))
 
 
 # Implementation of static abstract methods are not enforced if the subclass is never instantiated.
@@ -46,7 +46,7 @@ class Syncer(abc.ABC):
         raise NotImplementedError  # pragma: no cover
 
     @classmethod
-    async def sync(cls, guild: Guild, ctx: t.Optional[Context] = None) -> None:
+    async def sync(cls, guild: Guild, ctx: Context | None = None) -> None:
         """
         Synchronise the database with the cache of `guild`.
 
@@ -89,7 +89,7 @@ class RoleSyncer(Syncer):
     async def _get_diff(guild: Guild) -> _Diff:
         """Return the difference of roles between the cache of `guild` and the database."""
         log.trace("Getting the diff for roles.")
-        roles = await bot.instance.api_client.get('bot/roles')
+        roles = await bot.instance.api_client.get("bot/roles")
 
         # Pack DB roles and guild roles into one common, hashable format.
         # They're hashable so that they're easily comparable with sets later.
@@ -123,15 +123,15 @@ class RoleSyncer(Syncer):
         """Synchronise the database with the role cache of `guild`."""
         log.trace("Syncing created roles...")
         for role in diff.created:
-            await bot.instance.api_client.post('bot/roles', json=role._asdict())
+            await bot.instance.api_client.post("bot/roles", json=role._asdict())
 
         log.trace("Syncing updated roles...")
         for role in diff.updated:
-            await bot.instance.api_client.put(f'bot/roles/{role.id}', json=role._asdict())
+            await bot.instance.api_client.put(f"bot/roles/{role.id}", json=role._asdict())
 
         log.trace("Syncing deleted roles...")
         for role in diff.deleted:
-            await bot.instance.api_client.delete(f'bot/roles/{role.id}')
+            await bot.instance.api_client.delete(f"bot/roles/{role.id}")
 
 
 class UserSyncer(Syncer):
@@ -152,7 +152,7 @@ class UserSyncer(Syncer):
             # Store user fields which are to be updated.
             updated_fields = {}
 
-            def maybe_update(db_field: str, guild_value: t.Union[str, int]) -> None:
+            def maybe_update(db_field: str, guild_value: str | int) -> None:
                 # Equalize DB user and guild user attributes.
                 if db_user[db_field] != guild_value:  # noqa: B023
                     updated_fields[db_field] = guild_value  # noqa: B023
@@ -170,6 +170,7 @@ class UserSyncer(Syncer):
                 seen_guild_users.add(guild_user.id)
 
                 maybe_update("name", guild_user.name)
+                maybe_update("display_name", guild_user.display_name)
                 maybe_update("discriminator", int(guild_user.discriminator))
                 maybe_update("in_guild", True)
 
@@ -196,6 +197,7 @@ class UserSyncer(Syncer):
                 new_user = {
                     "id": member.id,
                     "name": member.name,
+                    "display_name": member.display_name,
                     "discriminator": int(member.discriminator),
                     "roles": [role.id for role in member.roles],
                     "in_guild": True
@@ -223,10 +225,10 @@ class UserSyncer(Syncer):
         # Using asyncio.gather would still consume too many resources on the site.
         log.trace("Syncing created users...")
         if diff.created:
-            for chunk in chunked(diff.created, CHUNK_SIZE):
+            for chunk in batched(diff.created, CHUNK_SIZE):
                 await bot.instance.api_client.post("bot/users", json=chunk)
 
         log.trace("Syncing updated users...")
         if diff.updated:
-            for chunk in chunked(diff.updated, CHUNK_SIZE):
+            for chunk in batched(diff.updated, CHUNK_SIZE):
                 await bot.instance.api_client.patch("bot/users/bulk_patch", json=chunk)

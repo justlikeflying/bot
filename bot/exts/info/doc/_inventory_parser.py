@@ -1,7 +1,7 @@
 import re
 import zlib
 from collections import defaultdict
-from typing import AsyncIterator, DefaultDict, List, Optional, Tuple
+from collections.abc import AsyncIterator
 
 import aiohttp
 
@@ -11,9 +11,9 @@ from bot.log import get_logger
 log = get_logger(__name__)
 
 FAILED_REQUEST_ATTEMPTS = 3
-_V2_LINE_RE = re.compile(r'(?x)(.+?)\s+(\S*:\S*)\s+(-?\d+)\s+?(\S*)\s+(.*)')
+_V2_LINE_RE = re.compile(r"(?x)(.+?)\s+(\S*:\S*)\s+(-?\d+)\s+?(\S*)\s+(.*)")
 
-InventoryDict = DefaultDict[str, List[Tuple[str, str]]]
+InventoryDict = defaultdict[str, list[tuple[str, str]]]
 
 
 class InvalidHeaderError(Exception):
@@ -38,14 +38,14 @@ class ZlibStreamReader:
 
     async def __aiter__(self) -> AsyncIterator[str]:
         """Yield lines of decompressed text."""
-        buf = b''
+        buf = b""
         async for chunk in self._read_compressed_chunks():
             buf += chunk
-            pos = buf.find(b'\n')
+            pos = buf.find(b"\n")
             while pos != -1:
                 yield buf[:pos].decode()
                 buf = buf[pos + 1:]
-                pos = buf.find(b'\n')
+                pos = buf.find(b"\n")
 
 
 async def _load_v1(stream: aiohttp.StreamReader) -> InventoryDict:
@@ -69,6 +69,13 @@ async def _load_v2(stream: aiohttp.StreamReader) -> InventoryDict:
 
     async for line in ZlibStreamReader(stream):
         m = _V2_LINE_RE.match(line.rstrip())
+
+        # If we don't have a match, the package is probably doing something
+        # funky with new-lines and we can discount this line, it's likely a
+        # multi-line figure description or something similar.
+        if not m:
+            continue
+
         name, type_, _prio, location, _dispname = m.groups()  # ignore the parsed items we don't need
         if location.endswith("$"):
             location = location[:-1] + name
@@ -97,7 +104,7 @@ async def _fetch_inventory(url: str) -> InventoryDict:
         if inventory_version == 1:
             return await _load_v1(stream)
 
-        elif inventory_version == 2:
+        if inventory_version == 2:
             if b"zlib" not in await stream.readline():
                 raise InvalidHeaderError("'zlib' not found in header of compressed inventory.")
             return await _load_v2(stream)
@@ -105,7 +112,7 @@ async def _fetch_inventory(url: str) -> InventoryDict:
         raise InvalidHeaderError("Incompatible inventory version.")
 
 
-async def fetch_inventory(url: str) -> Optional[InventoryDict]:
+async def fetch_inventory(url: str) -> InventoryDict | None:
     """
     Get an inventory dict from `url`, retrying `FAILED_REQUEST_ATTEMPTS` times on errors.
 

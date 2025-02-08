@@ -37,7 +37,9 @@ class TruncationTests(unittest.IsolatedAsyncioTestCase):
         self.cog.mod_log.ignore = Mock()
         self.ctx.guild.ban = AsyncMock()
 
-        await self.cog.apply_ban(self.ctx, self.target, "foo bar" * 3000)
+        infraction_reason = "foo bar" * 3000
+
+        await self.cog.apply_ban(self.ctx, self.target, infraction_reason)
         self.cog.apply_infraction.assert_awaited_once_with(
             self.ctx, {"foo": "bar", "purge": ""}, self.target, ANY
         )
@@ -46,9 +48,13 @@ class TruncationTests(unittest.IsolatedAsyncioTestCase):
         await action()
         self.ctx.guild.ban.assert_awaited_once_with(
             self.target,
-            reason=textwrap.shorten("foo bar" * 3000, 512, placeholder="..."),
+            reason=textwrap.shorten(infraction_reason, 512, placeholder="..."),
             delete_message_days=0
         )
+
+        # Assert that the reason sent to the database isn't truncated.
+        post_infraction_mock.assert_awaited_once()
+        self.assertEqual(post_infraction_mock.call_args.args[3], infraction_reason)
 
     @patch("bot.exts.moderation.infraction._utils.post_infraction")
     async def test_apply_kick_reason_truncation(self, post_infraction_mock):
@@ -59,14 +65,20 @@ class TruncationTests(unittest.IsolatedAsyncioTestCase):
         self.cog.mod_log.ignore = Mock()
         self.target.kick = AsyncMock()
 
-        await self.cog.apply_kick(self.ctx, self.target, "foo bar" * 3000)
+        infraction_reason = "foo bar" * 3000
+
+        await self.cog.apply_kick(self.ctx, self.target, infraction_reason)
         self.cog.apply_infraction.assert_awaited_once_with(
             self.ctx, {"foo": "bar"}, self.target, ANY
         )
 
         action = self.cog.apply_infraction.call_args.args[-1]
         await action()
-        self.target.kick.assert_awaited_once_with(reason=textwrap.shorten("foo bar" * 3000, 512, placeholder="..."))
+        self.target.kick.assert_awaited_once_with(reason=textwrap.shorten(infraction_reason, 512, placeholder="..."))
+
+        # Assert that the reason sent to the database isn't truncated.
+        post_infraction_mock.assert_awaited_once()
+        self.assertEqual(post_infraction_mock.call_args.args[3], infraction_reason)
 
 
 @patch("bot.exts.moderation.infraction.infractions.constants.Roles.voice_verified", new=123456)
@@ -270,10 +282,9 @@ class CleanBanTests(unittest.IsolatedAsyncioTestCase):
         def inner(name):
             if name == "ModManagement":
                 return self.management_cog if enable_manage else None
-            elif name == "Clean":
+            if name == "Clean":
                 return self.clean_cog if enable_clean else None
-            else:
-                return DEFAULT
+            return DEFAULT
         return inner
 
     async def test_cleanban_falls_back_to_native_purge_without_clean_cog(self):
